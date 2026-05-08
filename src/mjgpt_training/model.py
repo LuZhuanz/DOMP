@@ -28,6 +28,7 @@ class ModelConfig:
     @classmethod
     def preset(cls, name: str, *, vocab_size: int, max_position_embeddings: int = 512) -> ModelConfig:
         presets = {
+            "debug": dict(n_layers=1, n_heads=4, hidden_size=64, intermediate_size=128, scorer_hidden_size=64, dropout=0.0),
             "tiny": dict(n_layers=4, n_heads=4, hidden_size=256, intermediate_size=1024, scorer_hidden_size=256),
             "small": dict(n_layers=6, n_heads=6, hidden_size=384, intermediate_size=1536, scorer_hidden_size=384),
             "base": dict(n_layers=12, n_heads=12, hidden_size=768, intermediate_size=3072, scorer_hidden_size=768),

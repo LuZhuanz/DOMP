@@ -49,12 +49,25 @@ The JSONL output contains one record per decision with:
 
 ## Training Prototype
 
-Build a word-level vocab from converter JSONL:
+Build a word-level vocab from streaming mjson:
 
 ```bash
-uv run --with-editable . mjgpt-train build-vocab out/v0/decisions.long.jsonl \
-  --out out/train/vocab.json \
-  --limit-records 10000
+uv run --with-editable . mjgpt-train build-vocab data-draft \
+  --data-format mjson \
+  --out out/train/smoke/vocab.json
+```
+
+Run a minimal streaming training smoke:
+
+```bash
+uv run --with-editable . mjgpt-train train data-draft \
+  --data-format mjson \
+  --vocab out/train/smoke/vocab.json \
+  --output-dir out/train/smoke \
+  --model-size debug \
+  --batch-size 4 \
+  --max-steps 20 \
+  --device auto
 ```
 
 PyTorch is pinned to `torch==2.7.1+cu126` through the PyTorch CUDA 12.6 index.
