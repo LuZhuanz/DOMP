@@ -1,0 +1,30 @@
+[project]
+name = "mjgpt-converter"
+version = "0.1.0"
+description = "Trusted v0 converter from mjson riichi mahjong logs to GPT-style decision samples."
+requires-python = ">=3.12"
+dependencies = [
+    "torch==2.7.1+cu126",
+]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+mjgpt-convert = "mjgpt_converter.cli:main"
+mjgpt-train = "mjgpt_training.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }

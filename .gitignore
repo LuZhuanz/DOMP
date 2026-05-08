@@ -1,0 +1,36 @@
+# Python bytecode and test caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and local tool state
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Local datasets, generated outputs, and large intermediate files
+dataset/
+data-draft/
+out/
+*.jsonl
+*.jsonl.gz
+*.mjson
+*.mjson.gz
+
+# Local source/reference documents not intended for the code repository
+GPT架构的麻将AI.pdf
+
+# Editor and OS files
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
