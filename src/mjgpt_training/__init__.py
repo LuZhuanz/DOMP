@@ -1,7 +1,7 @@
 """Training utilities for Mahjong GPT-like policy models."""
 
 from .samples import PolicySample, SampleFormatError, build_policy_sample
-from .tokenizer import MahjongVocab, TokenizedSample, build_vocab, encode_sample, tokenize_text
+from .tokenizer import MahjongVocab, TokenizedSample, build_fixed_vocab, build_vocab, encode_sample, tokenize_text
 from .train import TrainConfig, TrainResult, train
 
 __all__ = [
@@ -12,6 +12,7 @@ __all__ = [
     "TrainResult",
     "TokenizedSample",
     "build_policy_sample",
+    "build_fixed_vocab",
     "build_vocab",
     "encode_sample",
     "train",

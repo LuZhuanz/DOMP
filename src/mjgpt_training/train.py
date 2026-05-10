@@ -11,7 +11,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from .collator import PolicyBatch, PolicyCollator
-from .dataset import JsonlPolicyDataset, MjsonStreamingPolicyDataset, iter_policy_samples
+from .dataset import JsonlPolicyDataset, MjsonStreamingPolicyDataset, _collect_mjson_files, iter_policy_samples
 from .model import MahjongPolicyModel, ModelConfig
 from .tokenizer import MahjongVocab, build_vocab
 
@@ -40,6 +40,11 @@ class TrainConfig:
     limit_records: int | None = None
     strict: bool = True
     shuffle_files: bool = False
+    val_inputs: list[Path] | None = None
+    val_manifest: Path | None = None
+    val_ratio: float = 0.0
+    val_batches: int = 20
+    eval_every: int = 0
 
 
 @dataclass(frozen=True)
@@ -48,6 +53,8 @@ class TrainResult:
     samples: int
     final_loss: float | None
     final_accuracy_top1: float | None
+    final_val_loss: float | None
+    final_val_accuracy_top1: float | None
     output_dir: Path
 
 
@@ -57,6 +64,12 @@ def train(config: TrainConfig) -> TrainResult:
         raise ValueError("max_steps must be positive")
     if config.batch_size < 1:
         raise ValueError("batch_size must be positive")
+    if not (0.0 <= config.val_ratio < 1.0):
+        raise ValueError("val_ratio must be in [0, 1)")
+    if config.val_batches < 1:
+        raise ValueError("val_batches must be positive")
+    if config.eval_every < 0:
+        raise ValueError("eval_every must be non-negative")
 
     _set_seed(config.seed)
     config.output_dir.mkdir(parents=True, exist_ok=True)
@@ -64,13 +77,15 @@ def train(config: TrainConfig) -> TrainResult:
     vocab = _load_or_build_vocab(config)
     vocab.save(config.output_dir / "vocab.json")
 
-    dataset = _build_dataset(config, vocab)
+    train_inputs, val_inputs = _resolve_train_val_inputs(config)
+    dataset = _build_dataset(config, vocab, train_inputs, limit_files=None if val_inputs else config.limit_files)
     loader = DataLoader(
         dataset,
         batch_size=config.batch_size,
         collate_fn=PolicyCollator(pad_id=vocab.pad_id, max_length=config.max_length),
         num_workers=config.num_workers,
     )
+    val_loader = _build_val_loader(config, vocab, val_inputs)
     model_config = ModelConfig.preset(
         config.model_size,
         vocab_size=len(vocab.id_to_token),
@@ -84,6 +99,8 @@ def train(config: TrainConfig) -> TrainResult:
     samples_seen = 0
     final_loss: float | None = None
     final_accuracy: float | None = None
+    final_val_loss: float | None = None
+    final_val_accuracy: float | None = None
     start = time.perf_counter()
     with log_path.open("w", encoding="utf-8") as log_file:
         for batch in loader:
@@ -113,6 +130,11 @@ def train(config: TrainConfig) -> TrainResult:
             final_accuracy = _accuracy_top1(output.logits.detach(), batch.labels)
             if steps % config.log_every == 0 or steps == 1:
                 elapsed = max(time.perf_counter() - start, 1e-9)
+                should_eval = val_loader is not None and (
+                    steps == 1 or steps % (config.eval_every or config.log_every) == 0
+                )
+                if should_eval:
+                    final_val_loss, final_val_accuracy = _evaluate(model, val_loader, device, config.val_batches)
                 event = {
                     "step": steps,
                     "samples": samples_seen,
@@ -121,19 +143,35 @@ def train(config: TrainConfig) -> TrainResult:
                     "samples_per_sec": samples_seen / elapsed,
                     "device": str(device),
                 }
+                if final_val_loss is not None and should_eval:
+                    event["val_loss"] = final_val_loss
+                    event["val_accuracy_top1"] = final_val_accuracy
                 log_file.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
                 log_file.flush()
-                print(
-                    f"step={steps} samples={samples_seen} "
-                    f"loss={final_loss:.4f} acc={final_accuracy:.3f}"
-                )
+                message = f"step={steps} samples={samples_seen} loss={final_loss:.4f} acc={final_accuracy:.3f}"
+                if final_val_loss is not None and should_eval:
+                    message += f" val_loss={final_val_loss:.4f} val_acc={final_val_accuracy:.3f}"
+                print(message)
 
-    _save_outputs(config, model_config, model, optimizer, steps, samples_seen, final_loss, final_accuracy)
+    _save_outputs(
+        config,
+        model_config,
+        model,
+        optimizer,
+        steps,
+        samples_seen,
+        final_loss,
+        final_accuracy,
+        final_val_loss,
+        final_val_accuracy,
+    )
     return TrainResult(
         steps=steps,
         samples=samples_seen,
         final_loss=final_loss,
         final_accuracy_top1=final_accuracy,
+        final_val_loss=final_val_loss,
+        final_val_accuracy_top1=final_val_accuracy,
         output_dir=config.output_dir,
     )
 
@@ -153,20 +191,92 @@ def _load_or_build_vocab(config: TrainConfig) -> MahjongVocab:
     return build_vocab(samples)
 
 
-def _build_dataset(config: TrainConfig, vocab: MahjongVocab):
+def _build_dataset(
+    config: TrainConfig,
+    vocab: MahjongVocab,
+    inputs: list[Path],
+    *,
+    limit_files: int | None,
+):
     if config.data_format == "jsonl":
-        return JsonlPolicyDataset(config.inputs, vocab=vocab, limit_records=config.limit_records)
+        return JsonlPolicyDataset(inputs, vocab=vocab, limit_records=config.limit_records)
     if config.data_format == "mjson":
         return MjsonStreamingPolicyDataset(
-            config.inputs,
+            inputs,
             vocab=vocab,
-            limit_files=config.limit_files,
+            limit_files=limit_files,
             limit_records=config.limit_records,
             strict=config.strict,
             shuffle_files=config.shuffle_files,
             seed=config.seed,
         )
     raise ValueError(f"unknown data_format: {config.data_format}")
+
+
+def _build_val_loader(config: TrainConfig, vocab: MahjongVocab, val_inputs: list[Path] | None) -> DataLoader | None:
+    if val_inputs is None or len(val_inputs) == 0:
+        return None
+    dataset = _build_dataset(config, vocab, val_inputs, limit_files=None)
+    return DataLoader(
+        dataset,
+        batch_size=config.batch_size,
+        collate_fn=PolicyCollator(pad_id=vocab.pad_id, max_length=config.max_length),
+        # Validation is intentionally bounded by val_batches; extra workers add overhead for small eval slices.
+        num_workers=0,
+    )
+
+
+def _resolve_train_val_inputs(config: TrainConfig) -> tuple[list[Path], list[Path] | None]:
+    if config.val_ratio == 0.0 and not config.val_inputs and config.val_manifest is None:
+        return list(config.inputs), None
+    if config.data_format != "mjson":
+        raise ValueError("validation split currently supports mjson inputs only")
+
+    all_files = _collect_mjson_files(
+        config.inputs,
+        limit_files=config.limit_files,
+        shuffle_files=config.shuffle_files,
+        seed=config.seed,
+    )
+    val_files = _resolve_val_files(config, all_files)
+    val_set = {path.resolve() for path in val_files}
+    train_files = [path for path in all_files if path.resolve() not in val_set]
+    if not train_files:
+        raise ValueError("validation split left no training files")
+    if not val_files:
+        raise ValueError("validation split produced no validation files")
+    _write_file_list(config.output_dir / "validation_files.txt", val_files)
+    return train_files, val_files
+
+
+def _resolve_val_files(config: TrainConfig, all_files: list[Path]) -> list[Path]:
+    if config.val_manifest is not None:
+        return _read_file_list(config.val_manifest)
+    if config.val_inputs:
+        return _collect_mjson_files(config.val_inputs)
+    if config.val_ratio <= 0.0:
+        return []
+    if len(all_files) < 2:
+        raise ValueError("val_ratio requires at least two mjson files")
+    rng = random.Random(config.seed)
+    shuffled = list(all_files)
+    rng.shuffle(shuffled)
+    val_count = max(1, round(len(shuffled) * config.val_ratio))
+    val_count = min(val_count, len(shuffled) - 1)
+    return sorted(shuffled[:val_count])
+
+
+def _read_file_list(path: Path) -> list[Path]:
+    if not path.exists():
+        raise FileNotFoundError(path)
+    files = [Path(line.strip()) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not files:
+        raise ValueError(f"validation manifest is empty: {path}")
+    return files
+
+
+def _write_file_list(path: Path, files: list[Path]) -> None:
+    path.write_text("".join(f"{file}\n" for file in files), encoding="utf-8")
 
 
 def _batch_to_device(batch: PolicyBatch, device: torch.device) -> PolicyBatch:
@@ -184,6 +294,41 @@ def _batch_to_device(batch: PolicyBatch, device: torch.device) -> PolicyBatch:
 def _accuracy_top1(logits: torch.Tensor, labels: torch.Tensor) -> float:
     predictions = logits.argmax(dim=-1)
     return float((predictions == labels).float().mean().cpu())
+
+
+@torch.no_grad()
+def _evaluate(
+    model: MahjongPolicyModel,
+    loader: DataLoader,
+    device: torch.device,
+    max_batches: int,
+) -> tuple[float, float]:
+    was_training = model.training
+    model.eval()
+    try:
+        losses: list[float] = []
+        accuracies: list[float] = []
+        for i, batch in enumerate(loader):
+            if i >= max_batches:
+                break
+            batch = _batch_to_device(batch, device)
+            output = model(
+                batch.input_ids,
+                batch.attention_mask,
+                batch.choice_positions,
+                batch.action_positions,
+                batch.action_mask,
+                batch.labels,
+            )
+            assert output.loss is not None
+            losses.append(float(output.loss.detach().cpu()))
+            accuracies.append(_accuracy_top1(output.logits.detach(), batch.labels))
+        if not losses:
+            raise RuntimeError("validation loader produced no batches")
+        return sum(losses) / len(losses), sum(accuracies) / len(accuracies)
+    finally:
+        if was_training:
+            model.train()
 
 
 def _resolve_device(device: str) -> torch.device:
@@ -212,6 +357,8 @@ def _save_outputs(
     samples_seen: int,
     final_loss: float | None,
     final_accuracy: float | None,
+    final_val_loss: float | None,
+    final_val_accuracy: float | None,
 ) -> None:
     torch.save(model.state_dict(), config.output_dir / "model.pt")
     torch.save(optimizer.state_dict(), config.output_dir / "optimizer.pt")
@@ -224,6 +371,8 @@ def _save_outputs(
         "samples": samples_seen,
         "final_loss": final_loss,
         "final_accuracy_top1": final_accuracy,
+        "final_val_loss": final_val_loss,
+        "final_val_accuracy_top1": final_val_accuracy,
         "train_config": _jsonable_train_config(config),
     }
     (config.output_dir / "train_state.json").write_text(
@@ -237,4 +386,6 @@ def _jsonable_train_config(config: TrainConfig) -> dict:
     data["inputs"] = [str(path) for path in config.inputs]
     data["output_dir"] = str(config.output_dir)
     data["vocab_path"] = str(config.vocab_path) if config.vocab_path is not None else None
+    data["val_inputs"] = [str(path) for path in config.val_inputs] if config.val_inputs is not None else None
+    data["val_manifest"] = str(config.val_manifest) if config.val_manifest is not None else None
     return data
