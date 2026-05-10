@@ -45,6 +45,8 @@ class TrainConfig:
     val_ratio: float = 0.0
     val_batches: int = 20
     eval_every: int = 0
+    save_every: int = 0
+    resume: bool = False
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,8 @@ def train(config: TrainConfig) -> TrainResult:
         raise ValueError("val_batches must be positive")
     if config.eval_every < 0:
         raise ValueError("eval_every must be non-negative")
+    if config.save_every < 0:
+        raise ValueError("save_every must be non-negative")
 
     _set_seed(config.seed)
     config.output_dir.mkdir(parents=True, exist_ok=True)
@@ -102,7 +106,13 @@ def train(config: TrainConfig) -> TrainResult:
     final_val_loss: float | None = None
     final_val_accuracy: float | None = None
     start = time.perf_counter()
-    with log_path.open("w", encoding="utf-8") as log_file:
+
+    if config.resume:
+        steps, samples_seen = _try_resume(config, model, optimizer)
+        start -= samples_seen / max(1, steps) * (time.perf_counter() - start)  # rough offset
+
+    log_mode = "a" if config.resume else "w"
+    with log_path.open(log_mode, encoding="utf-8") as log_file:
         for batch in loader:
             if steps >= config.max_steps:
                 break
@@ -153,6 +163,9 @@ def train(config: TrainConfig) -> TrainResult:
                     message += f" val_loss={final_val_loss:.4f} val_acc={final_val_accuracy:.3f}"
                 print(message)
 
+            if config.save_every > 0 and steps % config.save_every == 0:
+                _save_checkpoint(config, model_config, model, optimizer, steps, samples_seen)
+
     _save_outputs(
         config,
         model_config,
@@ -174,6 +187,57 @@ def train(config: TrainConfig) -> TrainResult:
         final_val_accuracy_top1=final_val_accuracy,
         output_dir=config.output_dir,
     )
+
+
+def _try_resume(config: TrainConfig, model: MahjongPolicyModel, optimizer: torch.optim.Optimizer) -> tuple[int, int]:
+    """Load checkpoint and return resumed step/sample counts."""
+    model_path = config.output_dir / "model.pt"
+    optimizer_path = config.output_dir / "optimizer.pt"
+    state_path = config.output_dir / "train_state.json"
+    if not model_path.exists():
+        raise FileNotFoundError(f"resume requested but checkpoint not found: {model_path}")
+    if not optimizer_path.exists():
+        raise FileNotFoundError(f"resume requested but optimizer state not found: {optimizer_path}")
+    if not state_path.exists():
+        raise FileNotFoundError(f"resume requested but train_state not found: {state_path}")
+
+    model.load_state_dict(torch.load(model_path, map_location="cpu", weights_only=True))
+    optimizer.load_state_dict(torch.load(optimizer_path, map_location="cpu", weights_only=True))
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    steps = int(state.get("steps", 0))
+    samples = int(state.get("samples", 0))
+    print(f"resumed from step={steps} samples={samples}")
+    return steps, samples
+
+
+def _save_checkpoint(
+    config: TrainConfig,
+    model_config: ModelConfig,
+    model: MahjongPolicyModel,
+    optimizer: torch.optim.Optimizer,
+    steps: int,
+    samples_seen: int,
+) -> None:
+    """Save a periodic checkpoint without overwriting the final outputs."""
+    ckpt_dir = config.output_dir / "checkpoints"
+    ckpt_dir.mkdir(exist_ok=True)
+    prefix = f"step_{steps}"
+    torch.save(model.state_dict(), ckpt_dir / f"{prefix}_model.pt")
+    torch.save(optimizer.state_dict(), ckpt_dir / f"{prefix}_optimizer.pt")
+    (ckpt_dir / f"{prefix}_model_config.json").write_text(
+        json.dumps(asdict(model_config), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    train_state = {
+        "steps": steps,
+        "samples": samples_seen,
+        "train_config": _jsonable_train_config(config),
+    }
+    (ckpt_dir / f"{prefix}_train_state.json").write_text(
+        json.dumps(train_state, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(f"saved checkpoint to {ckpt_dir}/{prefix}_*")
 
 
 def _load_or_build_vocab(config: TrainConfig) -> MahjongVocab:

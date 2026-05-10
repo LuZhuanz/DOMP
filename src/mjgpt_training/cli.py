@@ -55,6 +55,8 @@ def main(argv: list[str] | None = None) -> None:
     train_p.add_argument("--val-ratio", type=float, default=0.0)
     train_p.add_argument("--val-batches", type=int, default=20)
     train_p.add_argument("--eval-every", type=int, default=0)
+    train_p.add_argument("--save-every", type=int, default=0, help="Save a checkpoint every N steps (0=disable)")
+    train_p.add_argument("--resume", action="store_true", help="Resume from latest checkpoint in output-dir")
 
     args = parser.parse_args(argv)
     if args.cmd == "build-vocab":
@@ -104,6 +106,8 @@ def main(argv: list[str] | None = None) -> None:
             val_ratio=args.val_ratio,
             val_batches=args.val_batches,
             eval_every=args.eval_every,
+            save_every=args.save_every,
+            resume=args.resume,
         )
     )
     print(
